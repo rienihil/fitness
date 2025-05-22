@@ -1,0 +1,11 @@
+{
+  "@@locale": "en",
+  "title": "Welcome",
+  "language": "Language",
+  "name": "Name",
+  "save": "Save",
+  "home": "Home",
+  "workouts": "Workouts",
+  "nutrition": "Nutrition",
+  "profile": "Profile"
+}
