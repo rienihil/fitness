@@ -12,15 +12,15 @@ class YogaScreen extends StatefulWidget {
 class _YogaScreenState extends State<YogaScreen> {
   String selectedFilter = 'All';
 
-  List<String> get targetAreas {
-    final areas = yogaPoses.map((e) => e.targetArea).toSet().toList();
+  List<String> get types {
+    final areas = yogaPoses.map((e) => e.type).toSet().toList();
     areas.sort();
     return ['All', ...areas];
   }
 
   List<YogaPose> get filteredPoses {
     if (selectedFilter == 'All') return yogaPoses;
-    return yogaPoses.where((pose) => pose.targetArea == selectedFilter).toList();
+    return yogaPoses.where((pose) => pose.type == selectedFilter).toList();
   }
 
   @override
@@ -33,7 +33,7 @@ class _YogaScreenState extends State<YogaScreen> {
             padding: const EdgeInsets.all(12),
             child: DropdownButton<String>(
               value: selectedFilter,
-              items: targetAreas
+              items: types
                   .map((area) => DropdownMenuItem(
                 value: area,
                 child: Text(area),
@@ -55,7 +55,7 @@ class _YogaScreenState extends State<YogaScreen> {
                 return ListTile(
                   leading: const Icon(Icons.self_improvement),
                   title: Text(pose.name),
-                  subtitle: Text(pose.targetArea),
+                  subtitle: Text(pose.type),
                   onTap: () {
                     Navigator.push(
                       context,

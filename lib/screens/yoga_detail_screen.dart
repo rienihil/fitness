@@ -71,7 +71,7 @@ class _YogaDetailScreenState extends State<YogaDetailScreen> {
   Future<void> _trackYogaCompleted(int duration) async {
     await _trackingService.trackExercise(
       exerciseName: widget.pose.name,
-      category: 'Yoga - ${widget.pose.targetArea}',
+      category: 'Yoga - ${widget.pose.type}',
       durationInSeconds: duration,
     );
 
