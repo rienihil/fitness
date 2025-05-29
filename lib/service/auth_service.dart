@@ -1,4 +1,5 @@
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -11,6 +12,7 @@ class AuthService {
   final GoogleSignIn _googleSignIn = GoogleSignIn();
   final PinAuthService _pinAuth = PinAuthService();
   final OfflineService _offlineService = OfflineService();
+  final DatabaseReference _database = FirebaseDatabase.instance.ref();
 
   // Auth change stream
   Stream<User?> get authStateChanges => _auth.authStateChanges();
@@ -40,8 +42,9 @@ class AuthService {
         password: password,
       );
 
-      // Save user data to shared preferences
+      // Save user data to shared preferences and Realtime Database
       await _saveUserData(credential.user);
+      await _syncUserToDatabase(credential.user);
 
       // Ensure guest mode is turned off
       final prefs = await SharedPreferences.getInstance();
@@ -70,11 +73,28 @@ class AuthService {
         password: password,
       );
 
-      // Update display name
-      await credential.user?.updateDisplayName(name);
+      // КРИТИЧНО: Обновляем displayName сразу после создания аккаунта
+      if (credential.user != null) {
+        debugPrint('🔧 Setting displayName during account creation: $name');
+        await _updateDisplayNameRobust(credential.user!, name);
+
+        // Дополнительная проверка и попытка обновления
+        await credential.user!.reload();
+        final updatedUser = _auth.currentUser;
+
+        if (updatedUser?.displayName != name) {
+          debugPrint('⚠️ DisplayName not set properly, trying again...');
+          await _updateDisplayNameRobust(updatedUser!, name);
+        }
+
+        debugPrint('✅ Final displayName after account creation: ${_auth.currentUser?.displayName}');
+
+        // Create user profile in Realtime Database
+        await _createUserProfile(updatedUser!, name);
+      }
 
       // Save user data to shared preferences
-      await _saveUserData(credential.user);
+      await _saveUserData(_auth.currentUser);
 
       // Ensure guest mode is turned off
       final prefs = await SharedPreferences.getInstance();
@@ -114,6 +134,23 @@ class AuthService {
       // Sign in with credential
       final userCredential = await _auth.signInWithCredential(credential);
 
+      // For Google sign-in, the displayName should already be set
+      // But let's verify and fix if needed
+      if (userCredential.user != null) {
+        final currentDisplayName = userCredential.user!.displayName;
+        debugPrint('Google sign-in displayName: $currentDisplayName');
+
+        // If displayName is not set or is different from Google profile name
+        if (currentDisplayName == null || currentDisplayName.isEmpty) {
+          final googleDisplayName = googleUser.displayName ?? 'Google User';
+          debugPrint('⚠️ Fixing missing displayName from Google: $googleDisplayName');
+          await _updateDisplayNameRobust(userCredential.user!, googleDisplayName);
+        }
+
+        // Sync user to Realtime Database
+        await _syncUserToDatabase(userCredential.user);
+      }
+
       // Save user data to shared preferences
       await _saveUserData(userCredential.user);
 
@@ -128,7 +165,7 @@ class AuthService {
     }
   }
 
-  // NEW: Sign in with PIN when offline
+  // Sign in with PIN when offline
   Future<bool> signInWithPin(String pin) async {
     try {
       // Verify the PIN
@@ -152,12 +189,12 @@ class AuthService {
     }
   }
 
-  // NEW: Setup PIN for offline login
+  // Setup PIN for offline login
   Future<bool> setupPin(String pin) {
     return _pinAuth.setupPin(pin);
   }
 
-  // NEW: Check if PIN is set up
+  // Check if PIN is set up
   Future<bool> isPinSetup() {
     return _pinAuth.isPinSetup();
   }
@@ -198,6 +235,258 @@ class AuthService {
     return prefs.getBool('offline_authenticated') ?? false;
   }
 
+  // Create user profile in Realtime Database
+  Future<void> _createUserProfile(User user, String displayName) async {
+    try {
+      final userRef = _database.child('users').child(user.uid);
+
+      final userData = {
+        'uid': user.uid,
+        'email': user.email ?? '',
+        'displayName': displayName,
+        'photoURL': user.photoURL ?? '',
+        'phoneNumber': user.phoneNumber ?? '',
+        'emailVerified': user.emailVerified,
+        'createdAt': ServerValue.timestamp,
+        'lastSignInAt': ServerValue.timestamp,
+        'isOnline': true,
+        'deviceInfo': {
+          'platform': 'flutter',
+          'version': '1.0.0',
+        }
+      };
+
+      await userRef.set(userData);
+      debugPrint('✅ User profile created in Realtime Database');
+    } catch (e) {
+      debugPrint('❌ Error creating user profile in database: $e');
+    }
+  }
+
+  // Sync user to Realtime Database
+  Future<void> _syncUserToDatabase(User? user) async {
+    if (user == null) return;
+
+    try {
+      final userRef = _database.child('users').child(user.uid);
+
+      // Check if user exists in database
+      final snapshot = await userRef.get();
+
+      final userData = {
+        'uid': user.uid,
+        'email': user.email ?? '',
+        'displayName': user.displayName ?? 'User',
+        'photoURL': user.photoURL ?? '',
+        'phoneNumber': user.phoneNumber ?? '',
+        'emailVerified': user.emailVerified,
+        'lastSignInAt': ServerValue.timestamp,
+        'isOnline': true,
+      };
+
+      if (snapshot.exists) {
+        // Update existing user
+        await userRef.update(userData);
+        debugPrint('✅ User data updated in Realtime Database');
+      } else {
+        // Create new user profile
+        userData['createdAt'] = ServerValue.timestamp;
+        await userRef.set(userData);
+        debugPrint('✅ New user profile created in Realtime Database');
+      }
+
+      // Set user offline when app is closed
+      userRef.child('isOnline').onDisconnect().set(false);
+
+    } catch (e) {
+      debugPrint('❌ Error syncing user to database: $e');
+    }
+  }
+
+  // Update user name in Firebase Auth and Realtime Database
+  Future<void> updateUserName(String newName) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) {
+        throw Exception('No authenticated user found');
+      }
+
+      debugPrint('🔄 Starting comprehensive name update to: "$newName"');
+
+      // Step 1: Update displayName in Firebase Auth
+      await _updateDisplayNameRobust(user, newName);
+
+      // Step 2: Update in Realtime Database
+      if (await isOnline) {
+        final userRef = _database.child('users').child(user.uid);
+        await userRef.update({
+          'displayName': newName,
+          'lastUpdatedAt': ServerValue.timestamp,
+        });
+        debugPrint('✅ Name updated in Realtime Database');
+      }
+
+      // Step 3: Update local storage
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('name', newName);
+      debugPrint('✅ Name updated in local storage');
+
+      debugPrint('✅ Comprehensive name update completed');
+
+    } catch (e) {
+      debugPrint('❌ Error updating user name: $e');
+      rethrow;
+    }
+  }
+
+  // Update user password
+  Future<void> updateUserPassword(String newPassword) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) {
+        throw Exception('No authenticated user found');
+      }
+
+      await user.updatePassword(newPassword);
+
+      // Update last password change timestamp in database
+      if (await isOnline) {
+        final userRef = _database.child('users').child(user.uid);
+        await userRef.update({
+          'lastPasswordChangeAt': ServerValue.timestamp,
+        });
+      }
+
+      debugPrint('✅ Password updated successfully');
+    } catch (e) {
+      debugPrint('❌ Error updating password: $e');
+      rethrow;
+    }
+  }
+
+  // Reauthenticate user
+  Future<void> reauthenticateUser(String email, String password) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) {
+        throw Exception('No authenticated user found');
+      }
+
+      final credential = EmailAuthProvider.credential(
+        email: email,
+        password: password,
+      );
+
+      await user.reauthenticateWithCredential(credential);
+      debugPrint('✅ User reauthenticated successfully');
+    } catch (e) {
+      debugPrint('❌ Reauthentication failed: $e');
+      rethrow;
+    }
+  }
+
+  // Get current user data from all sources
+  Future<Map<String, dynamic>> getCurrentUserData() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final user = _auth.currentUser;
+
+      Map<String, dynamic> userData = {
+        'name': prefs.getString('name') ?? 'User',
+        'email': prefs.getString('email') ?? 'No email',
+        'uid': prefs.getString('uid') ?? 'No UID',
+        'photoURL': prefs.getString('photoURL') ?? '',
+        'isOnline': await isOnline,
+        'isGuestMode': await isGuestMode(),
+      };
+
+      // Add Firebase Auth data if available
+      if (user != null) {
+        userData.addAll({
+          'firebaseDisplayName': user.displayName ?? 'No display name',
+          'firebaseEmail': user.email ?? 'No email',
+          'firebaseUID': user.uid,
+          'firebasePhotoURL': user.photoURL ?? '',
+          'emailVerified': user.emailVerified,
+        });
+
+        // Get data from Realtime Database if online
+        if (await isOnline) {
+          try {
+            final userRef = _database.child('users').child(user.uid);
+            final snapshot = await userRef.get();
+
+            if (snapshot.exists) {
+              final dbData = Map<String, dynamic>.from(snapshot.value as Map);
+              userData['databaseData'] = dbData;
+            }
+          } catch (e) {
+            debugPrint('Error fetching database data: $e');
+          }
+        }
+      }
+
+      return userData;
+    } catch (e) {
+      debugPrint('Error getting current user data: $e');
+      return {};
+    }
+  }
+
+  // Get Firebase displayName specifically
+  Future<String> getFirebaseDisplayName() async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) {
+        return 'User offline';
+      }
+
+      await user.reload();
+      final updatedUser = _auth.currentUser;
+      return updatedUser?.displayName ?? 'No display name';
+    } catch (e) {
+      debugPrint('Error getting Firebase display name: $e');
+      return 'Error: ${e.toString()}';
+    }
+  }
+
+  // Force Firebase sync
+  Future<void> forceFirebaseSync() async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) return;
+
+      await user.reload();
+
+      // Also sync with database if online
+      if (await isOnline) {
+        await _syncUserToDatabase(user);
+      }
+
+      debugPrint('🔄 Firebase sync completed');
+    } catch (e) {
+      debugPrint('❌ Firebase sync failed: $e');
+    }
+  }
+
+  // Get user data from Realtime Database
+  Future<Map<String, dynamic>?> getUserFromDatabase(String uid) async {
+    try {
+      if (!await isOnline) return null;
+
+      final userRef = _database.child('users').child(uid);
+      final snapshot = await userRef.get();
+
+      if (snapshot.exists) {
+        return Map<String, dynamic>.from(snapshot.value as Map);
+      }
+      return null;
+    } catch (e) {
+      debugPrint('Error getting user from database: $e');
+      return null;
+    }
+  }
+
   // Save user data to shared preferences
   Future<void> _saveUserData(User? user) async {
     if (user == null) return;
@@ -220,6 +509,21 @@ class AuthService {
   // Sign out - handles both online and offline authentication
   Future<void> signOut() async {
     try {
+      final user = _auth.currentUser;
+
+      // Set user offline in database before signing out
+      if (user != null && await isOnline) {
+        try {
+          final userRef = _database.child('users').child(user.uid);
+          await userRef.update({
+            'isOnline': false,
+            'lastSeenAt': ServerValue.timestamp,
+          });
+        } catch (e) {
+          debugPrint('Error updating user status on signout: $e');
+        }
+      }
+
       await _googleSignIn.signOut();
       await _auth.signOut();
 
@@ -231,6 +535,8 @@ class AuthService {
       await prefs.remove('uid');
       await prefs.remove('photoURL');
       await prefs.remove('isGuestMode');
+
+      debugPrint('✅ User signed out successfully');
 
       // Note: We do NOT clear the PIN setup - that stays for future offline logins
     } catch (e) {
@@ -256,10 +562,11 @@ class AuthService {
       rethrow;
     }
   }
-  // Метод для удаления аккаунта пользователя
+
+  // Delete user account
   Future<void> deleteAccount(String password) async {
     try {
-      // Проверяем подключение к интернету
+      // Check connectivity
       if (!await isOnline) {
         throw FirebaseAuthException(
           code: 'network-error',
@@ -267,7 +574,7 @@ class AuthService {
         );
       }
 
-      // Проверяем, что пользователь авторизован
+      // Check if user is authenticated
       final user = _auth.currentUser;
       if (user == null) {
         throw FirebaseAuthException(
@@ -276,26 +583,32 @@ class AuthService {
         );
       }
 
-      // Для повторной аутентификации перед удалением аккаунта
+      // Reauthenticate before deletion
       if (user.email != null && password.isNotEmpty) {
-        // Создаем учетные данные для повторной аутентификации
         final credential = EmailAuthProvider.credential(
           email: user.email!,
           password: password,
         );
-
-        // Повторно аутентифицируем пользователя
         await user.reauthenticateWithCredential(credential);
       }
 
-      // Удаляем учетную запись пользователя в Firebase
+      // Delete user data from Realtime Database
+      try {
+        final userRef = _database.child('users').child(user.uid);
+        await userRef.remove();
+        debugPrint('✅ User data deleted from Realtime Database');
+      } catch (e) {
+        debugPrint('❌ Error deleting user data from database: $e');
+      }
+
+      // Delete user account in Firebase
       await user.delete();
 
-      // Очищаем локальные данные
+      // Clear local data
       final prefs = await SharedPreferences.getInstance();
-      await prefs.clear(); // Очищаем все хранилище предпочтений
+      await prefs.clear();
 
-      // Также очищаем PIN и любые другие данные аутентификации
+      // Clear PIN data
       await _pinAuth.resetPin();
 
       debugPrint('Account successfully deleted');
@@ -313,102 +626,208 @@ class AuthService {
   // Get pending sync count
   int get pendingSyncCount => _offlineService.pendingSyncCount;
 
-  // НОВЫЕ МЕТОДЫ ДЛЯ ОБНОВЛЕНИЯ ПРОФИЛЯ
+  // КРИТИЧНО УЛУЧШЕННЫЙ МЕТОД ДЛЯ ОБНОВЛЕНИЯ DISPLAYNAME
+  Future<void> _updateDisplayNameRobust(User user, String newName) async {
+    debugPrint('🔧 Starting robust displayName update to: "$newName"');
 
-  // Обновление имени пользователя
-  Future<void> updateUserName(String newName) async {
+    if (newName.trim().isEmpty) {
+      debugPrint('❌ Empty name provided, skipping update');
+      return;
+    }
+
     try {
-      // Проверяем подключение к интернету
-      if (!await isOnline) {
-        throw FirebaseAuthException(
-          code: 'network-error',
-          message: 'No internet connection. Profile update requires internet.',
-        );
+      // Метод 1: Прямое обновление через updateProfile
+      debugPrint('📝 Method 1: updateProfile');
+      await user.updateProfile(displayName: newName);
+      await user.reload();
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      User? updatedUser = _auth.currentUser;
+      debugPrint('Method 1 result: ${updatedUser?.displayName}');
+
+      // Метод 2: Повторное обновление если первый не сработал
+      if (updatedUser?.displayName != newName) {
+        debugPrint('📝 Method 2: Retry updateProfile');
+        await updatedUser?.updateProfile(displayName: newName);
+        await updatedUser?.reload();
+        await Future.delayed(const Duration(milliseconds: 500));
+        updatedUser = _auth.currentUser;
+        debugPrint('Method 2 result: ${updatedUser?.displayName}');
       }
 
-      // Проверяем, что пользователь авторизован
+      // Метод 3: Использование updateDisplayName напрямую
+      if (updatedUser?.displayName != newName) {
+        debugPrint('📝 Method 3: updateDisplayName');
+        await updatedUser?.updateDisplayName(newName);
+        await updatedUser?.reload();
+        await Future.delayed(const Duration(milliseconds: 500));
+        updatedUser = _auth.currentUser;
+        debugPrint('Method 3 result: ${updatedUser?.displayName}');
+      }
+
+      // Финальная проверка
+      final finalUser = _auth.currentUser;
+      if (finalUser?.displayName == newName) {
+        debugPrint('✅ DisplayName successfully updated to: "${finalUser?.displayName}"');
+      } else {
+        debugPrint('⚠️ DisplayName update may not have taken effect. Current: "${finalUser?.displayName}", Expected: "$newName"');
+      }
+
+    } catch (e) {
+      debugPrint('❌ Error updating displayName: $e');
+      rethrow;
+    }
+  }
+
+  // Update user extension for displayName directly
+  Future<void> updateDisplayName(String newName) async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      throw Exception('No authenticated user found');
+    }
+
+    await _updateDisplayNameRobust(user, newName);
+  }
+
+  // Set user online status
+  Future<void> setUserOnlineStatus(bool isOnline) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null || !await this.isOnline) return;
+
+      final userRef = _database.child('users').child(user.uid);
+      await userRef.update({
+        'isOnline': isOnline,
+        'lastSeenAt': ServerValue.timestamp,
+      });
+    } catch (e) {
+      debugPrint('Error updating online status: $e');
+    }
+  }
+
+  // Get all users from database (for admin or other features)
+  Future<List<Map<String, dynamic>>> getAllUsers() async {
+    try {
+      if (!await isOnline) return [];
+
+      final usersRef = _database.child('users');
+      final snapshot = await usersRef.get();
+
+      if (snapshot.exists) {
+        final usersData = Map<String, dynamic>.from(snapshot.value as Map);
+        return usersData.values
+            .map((user) => Map<String, dynamic>.from(user as Map))
+            .toList();
+      }
+      return [];
+    } catch (e) {
+      debugPrint('Error getting all users: $e');
+      return [];
+    }
+  }
+
+  // Search users by name or email
+  Future<List<Map<String, dynamic>>> searchUsers(String query) async {
+    try {
+      if (!await isOnline || query.trim().isEmpty) return [];
+
+      final usersRef = _database.child('users');
+      final snapshot = await usersRef.get();
+
+      if (snapshot.exists) {
+        final usersData = Map<String, dynamic>.from(snapshot.value as Map);
+        final queryLower = query.toLowerCase();
+
+        return usersData.values
+            .map((user) => Map<String, dynamic>.from(user as Map))
+            .where((user) {
+          final name = (user['displayName'] ?? '').toString().toLowerCase();
+          final email = (user['email'] ?? '').toString().toLowerCase();
+          return name.contains(queryLower) || email.contains(queryLower);
+        })
+            .toList();
+      }
+      return [];
+    } catch (e) {
+      debugPrint('Error searching users: $e');
+      return [];
+    }
+  }
+
+  // Update user profile picture
+  Future<void> updateUserProfilePicture(String photoURL) async {
+    try {
       final user = _auth.currentUser;
       if (user == null) {
-        throw FirebaseAuthException(
-          code: 'no-user',
-          message: 'No authenticated user found.',
-        );
+        throw Exception('No authenticated user found');
       }
 
-      // Обновляем имя в Firebase
-      await user.updateDisplayName(newName);
+      // Update in Firebase Auth
+      await user.updatePhotoURL(photoURL);
+      await user.reload();
 
-      // Обновляем имя в локальном хранилище
+      // Update in Realtime Database
+      if (await isOnline) {
+        final userRef = _database.child('users').child(user.uid);
+        await userRef.update({
+          'photoURL': photoURL,
+          'lastUpdatedAt': ServerValue.timestamp,
+        });
+      }
+
+      // Update local storage
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('name', newName);
+      await prefs.setString('photoURL', photoURL);
 
+      debugPrint('✅ Profile picture updated successfully');
     } catch (e) {
-      debugPrint('Update name error: $e');
+      debugPrint('❌ Error updating profile picture: $e');
       rethrow;
     }
   }
 
-  // Повторная аутентификация пользователя (требуется для некоторых операций)
-  Future<void> reauthenticateUser(String email, String password) async {
-    try {
-      // Проверяем подключение к интернету
-      if (!await isOnline) {
-        throw FirebaseAuthException(
-          code: 'network-error',
-          message: 'No internet connection. Reauthentication requires internet.',
-        );
+  // Listen to user changes in real-time
+  Stream<Map<String, dynamic>?> getUserStream(String uid) {
+    return _database
+        .child('users')
+        .child(uid)
+        .onValue
+        .map((event) {
+      if (event.snapshot.exists) {
+        return Map<String, dynamic>.from(event.snapshot.value as Map);
       }
-
-      // Проверяем, что пользователь авторизован
-      final user = _auth.currentUser;
-      if (user == null) {
-        throw FirebaseAuthException(
-          code: 'no-user',
-          message: 'No authenticated user found.',
-        );
-      }
-
-      // Создаем учетные данные для повторной аутентификации
-      final credential = EmailAuthProvider.credential(
-        email: email,
-        password: password,
-      );
-
-      // Повторно аутентифицируем пользователя
-      await user.reauthenticateWithCredential(credential);
-
-    } catch (e) {
-      debugPrint('Reauthentication error: $e');
-      rethrow;
-    }
+      return null;
+    });
   }
 
-  // Обновление пароля пользователя
-  Future<void> updateUserPassword(String newPassword) async {
+  // Get user statistics
+  Future<Map<String, dynamic>> getUserStats() async {
     try {
-      // Проверяем подключение к интернету
-      if (!await isOnline) {
-        throw FirebaseAuthException(
-          code: 'network-error',
-          message: 'No internet connection. Password update requires internet.',
-        );
+      if (!await isOnline) return {};
+
+      final usersRef = _database.child('users');
+      final snapshot = await usersRef.get();
+
+      if (snapshot.exists) {
+        final usersData = Map<String, dynamic>.from(snapshot.value as Map);
+        final users = usersData.values.map((user) => Map<String, dynamic>.from(user as Map)).toList();
+
+        final totalUsers = users.length;
+        final onlineUsers = users.where((user) => user['isOnline'] == true).length;
+        final verifiedUsers = users.where((user) => user['emailVerified'] == true).length;
+
+        return {
+          'totalUsers': totalUsers,
+          'onlineUsers': onlineUsers,
+          'verifiedUsers': verifiedUsers,
+          'offlineUsers': totalUsers - onlineUsers,
+          'unverifiedUsers': totalUsers - verifiedUsers,
+        };
       }
-
-      // Проверяем, что пользователь авторизован
-      final user = _auth.currentUser;
-      if (user == null) {
-        throw FirebaseAuthException(
-          code: 'no-user',
-          message: 'No authenticated user found.',
-        );
-      }
-
-      // Обновляем пароль в Firebase
-      await user.updatePassword(newPassword);
-
+      return {};
     } catch (e) {
-      debugPrint('Update password error: $e');
-      rethrow;
+      debugPrint('Error getting user stats: $e');
+      return {};
     }
   }
 }

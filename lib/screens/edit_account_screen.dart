@@ -31,11 +31,13 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
   bool _isConfirmPasswordVisible = false;
   String _errorMessage = '';
   String _successMessage = '';
+  String _firebaseStatus = '';
 
   @override
   void initState() {
     super.initState();
     _nameController.text = widget.currentName;
+    _checkInitialFirebaseStatus();
   }
 
   @override
@@ -47,6 +49,14 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
     super.dispose();
   }
 
+  // Check initial Firebase status
+  Future<void> _checkInitialFirebaseStatus() async {
+    final firebaseDisplayName = await _authService.getFirebaseDisplayName();
+    setState(() {
+      _firebaseStatus = 'Firebase display name: $firebaseDisplayName';
+    });
+  }
+
   // Update user profile name
   Future<void> _updateName() async {
     final newName = _nameController.text.trim();
@@ -54,21 +64,56 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
       return; // No change, no need to update
     }
 
+    if (newName.isEmpty) {
+      setState(() {
+        _errorMessage = 'Name cannot be empty';
+        _successMessage = '';
+      });
+      return;
+    }
+
     setState(() => _isLoading = true);
 
     try {
-      // Update name in Firebase
+      debugPrint('🔄 Starting name update process...');
+
+      // Update name in Firebase (this will also update local storage)
       await _authService.updateUserName(newName);
 
-      // Update name in SharedPreferences
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('name', newName);
+      // Multiple sync attempts to ensure data is updated
+      debugPrint('🔄 Performing sync attempts...');
+
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        await _authService.forceFirebaseSync();
+        await Future.delayed(Duration(milliseconds: 300 * attempt));
+
+        final firebaseDisplayName = await _authService.getFirebaseDisplayName();
+        debugPrint('Sync attempt $attempt: $firebaseDisplayName');
+
+        if (firebaseDisplayName == newName) {
+          debugPrint('✅ Name sync successful on attempt $attempt');
+          break;
+        }
+      }
+
+      // Get final data from Firebase to verify update
+      final userData = await _authService.getCurrentUserData();
+      final actualName = userData['name'] ?? newName;
+      final firebaseDisplayName = await _authService.getFirebaseDisplayName();
 
       setState(() {
-        _successMessage = 'Name updated successfully';
+        _successMessage = 'Name updated successfully!\nDisplayName in Firebase: $firebaseDisplayName';
         _errorMessage = '';
+        _firebaseStatus = 'Firebase display name: $firebaseDisplayName';
       });
+
+      // Update field with actual value from Firebase
+      _nameController.text = actualName;
+
+      debugPrint('✅ Name update completed successfully');
+
     } catch (e) {
+      debugPrint('❌ Name update failed: $e');
       setState(() {
         _errorMessage = 'Failed to update name: ${e.toString()}';
         _successMessage = '';
@@ -86,6 +131,11 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
 
     if (_newPasswordController.text != _confirmPasswordController.text) {
       setState(() => _errorMessage = 'New passwords do not match');
+      return;
+    }
+
+    if (_newPasswordController.text.length < 6) {
+      setState(() => _errorMessage = 'Password must be at least 6 characters');
       return;
     }
 
@@ -119,8 +169,11 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
         case 'requires-recent-login':
           message = 'This operation requires recent authentication. Please log in again before retrying';
           break;
+        case 'network-error':
+          message = 'No internet connection. Profile update requires internet.';
+          break;
         default:
-          message = 'Error updating password: ${e.code}';
+          message = 'Error updating password: ${e.message ?? e.code}';
       }
       setState(() {
         _errorMessage = message;
@@ -140,6 +193,12 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
   Future<void> _saveChanges() async {
     if (!_formKey.currentState!.validate()) return;
 
+    // Clear previous messages
+    setState(() {
+      _errorMessage = '';
+      _successMessage = '';
+    });
+
     // Update profile information
     await _updateName();
 
@@ -149,230 +208,360 @@ class _EditAccountScreenState extends State<EditAccountScreen> {
       await _updatePassword();
     }
 
-    // If no errors, navigate back
-    if (_errorMessage.isEmpty && !mounted) return;
+    // If no errors, navigate back with updated name
+    if (_errorMessage.isEmpty) {
+      try {
+        // Additional sync before getting final data
+        await _authService.forceFirebaseSync();
+        await Future.delayed(const Duration(milliseconds: 500));
 
-    // If successful and no errors, go back after a short delay
-    if (_errorMessage.isEmpty && _successMessage.isNotEmpty) {
-      Future.delayed(const Duration(seconds: 1), () {
+        final userData = await _authService.getCurrentUserData();
+        final updatedName = userData['name'] ?? _nameController.text;
+        final firebaseDisplayName = await _authService.getFirebaseDisplayName();
+
+        debugPrint('Final check before navigation:');
+        debugPrint('- userData name: $updatedName');
+        debugPrint('- Firebase displayName: $firebaseDisplayName');
+
+        if (_successMessage.isNotEmpty) {
+          // Show success message briefly then navigate back
+          Future.delayed(const Duration(seconds: 3), () {
+            if (mounted) Navigator.pop(context, updatedName);
+          });
+        } else {
+          // Navigate back immediately if only name was updated
+          if (mounted) Navigator.pop(context, updatedName);
+        }
+      } catch (e) {
+        debugPrint('Error getting final user data: $e');
+        // Fallback to controller text if Firebase data fetch fails
         if (mounted) Navigator.pop(context, _nameController.text);
+      }
+    }
+  }
+
+  // Enhanced Firebase sync check
+  Future<void> _checkFirebaseSync() async {
+    setState(() => _isLoading = true);
+
+    try {
+      debugPrint('🔄 Manual sync check initiated...');
+
+      // Force sync multiple times
+      for (int i = 1; i <= 3; i++) {
+        await _authService.forceFirebaseSync();
+        await Future.delayed(Duration(milliseconds: 200 * i));
+      }
+
+      final userData = await _authService.getCurrentUserData();
+      final firebaseDisplayName = await _authService.getFirebaseDisplayName();
+      final localName = userData['name'];
+
+      setState(() {
+        _successMessage = '''Sync Results:
+• Firebase displayName: "$firebaseDisplayName"
+• Local storage name: "$localName"
+• Controller text: "${_nameController.text}"
+${firebaseDisplayName == _nameController.text ? "✅ Sync successful!" : "⚠️ Sync may be pending..."}''';
+        _errorMessage = '';
+        _firebaseStatus = 'Firebase display name: $firebaseDisplayName';
       });
+
+      // Auto-update field if Firebase has different data
+      if (firebaseDisplayName != 'User offline' &&
+          firebaseDisplayName != 'No display name' &&
+          !firebaseDisplayName.startsWith('Error:') &&
+          firebaseDisplayName != _nameController.text) {
+        _nameController.text = firebaseDisplayName;
+      }
+
+      debugPrint('✅ Manual sync check completed');
+
+    } catch (e) {
+      setState(() {
+        _errorMessage = 'Sync check failed: $e';
+        _successMessage = '';
+      });
+      debugPrint('❌ Manual sync check failed: $e');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  // Force update Firebase displayName (debugging tool)
+  Future<void> _forceUpdateDisplayName() async {
+    final newName = _nameController.text.trim();
+    if (newName.isEmpty) return;
+
+    setState(() => _isLoading = true);
+
+    try {
+      debugPrint('🔧 Force updating Firebase displayName...');
+
+      // Direct Firebase update without additional logic
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        await user.updateDisplayName(newName);
+        await user.reload();
+
+        // Wait for sync
+        await Future.delayed(const Duration(milliseconds: 1000));
+
+        final updatedUser = FirebaseAuth.instance.currentUser;
+        final finalDisplayName = updatedUser?.displayName ?? 'Failed to update';
+
+        setState(() {
+          _successMessage = 'Force update completed!\nFirebase displayName: $finalDisplayName';
+          _errorMessage = '';
+          _firebaseStatus = 'Firebase display name: $finalDisplayName';
+        });
+
+        debugPrint('✅ Force update completed: $finalDisplayName');
+      } else {
+        throw Exception('No authenticated user found');
+      }
+    } catch (e) {
+      debugPrint('❌ Force update failed: $e');
+      setState(() {
+        _errorMessage = 'Force update failed: $e';
+        _successMessage = '';
+      });
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Edit Account'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
-          TextButton(
-            onPressed: _isLoading ? null : _saveChanges,
-            child: _isLoading
-                ? const SizedBox(
-              height: 20,
-              width: 20,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-                : const Text('SAVE'),
+          // Debug sync button
+          IconButton(
+            onPressed: _isLoading ? null : _checkFirebaseSync,
+            icon: const Icon(Icons.sync),
+            tooltip: 'Check Firebase Sync',
           ),
         ],
       ),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
-          child: Form(
-            key: _formKey,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Success message
-                if (_successMessage.isNotEmpty)
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    margin: const EdgeInsets.only(bottom: 16),
-                    decoration: BoxDecoration(
-                      color: Colors.green.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.green),
-                    ),
-                    child: Text(
-                      _successMessage,
-                      style: const TextStyle(color: Colors.green),
-                    ),
-                  ),
-
-                // Error message
-                if (_errorMessage.isNotEmpty)
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    margin: const EdgeInsets.only(bottom: 16),
-                    decoration: BoxDecoration(
-                      color: Colors.red.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.red),
-                    ),
-                    child: Text(
-                      _errorMessage,
-                      style: const TextStyle(color: Colors.red),
-                    ),
-                  ),
-
-                // Profile Information Section
-                Text(
-                  'Profile Information',
-                  style: theme.textTheme.titleLarge,
-                ),
-                const SizedBox(height: 8),
-                TextFormField(
-                  controller: _nameController,
-                  decoration: InputDecoration(
-                    labelText: 'Full Name',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.isEmpty) {
-                      return 'Please enter your name';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Email: ${widget.currentEmail}',
-                  style: const TextStyle(color: Colors.grey),
-                ),
-                const Text(
-                  'Email cannot be changed',
-                  style: TextStyle(color: Colors.grey, fontSize: 12),
-                ),
-
-                const SizedBox(height: 32),
-
-                // Password Change Section
-                Text(
-                  'Change Password',
-                  style: theme.textTheme.titleLarge,
-                ),
-                const SizedBox(height: 8),
-                TextFormField(
-                  controller: _currentPasswordController,
-                  obscureText: !_isPasswordVisible,
-                  decoration: InputDecoration(
-                    labelText: 'Current Password',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _isPasswordVisible ? Icons.visibility_off : Icons.visibility,
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Firebase Status Card
+              Card(
+                color: Colors.blue.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(12.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Firebase Status',
+                        style: TextStyle(fontWeight: FontWeight.bold),
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _isPasswordVisible = !_isPasswordVisible;
-                        });
-                      },
-                    ),
-                  ),
-                  validator: (value) {
-                    // Only validate if trying to change password
-                    if (_newPasswordController.text.isNotEmpty && (value == null || value.isEmpty)) {
-                      return 'Please enter your current password';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 16),
-                TextFormField(
-                  controller: _newPasswordController,
-                  obscureText: !_isNewPasswordVisible,
-                  decoration: InputDecoration(
-                    labelText: 'New Password',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _isNewPasswordVisible ? Icons.visibility_off : Icons.visibility,
+                      const SizedBox(height: 4),
+                      Text(
+                        _firebaseStatus,
+                        style: const TextStyle(fontSize: 12),
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _isNewPasswordVisible = !_isNewPasswordVisible;
-                        });
-                      },
-                    ),
-                  ),
-                  validator: (value) {
-                    // Only validate if field is not empty (password change is optional)
-                    if (value != null && value.isNotEmpty && value.length < 6) {
-                      return 'Password must be at least 6 characters';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 16),
-                TextFormField(
-                  controller: _confirmPasswordController,
-                  obscureText: !_isConfirmPasswordVisible,
-                  decoration: InputDecoration(
-                    labelText: 'Confirm New Password',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _isConfirmPasswordVisible ? Icons.visibility_off : Icons.visibility,
+                      const SizedBox(height: 8),
+                      ElevatedButton.icon(
+                        onPressed: _isLoading ? null : _forceUpdateDisplayName,
+                        icon: const Icon(Icons.build, size: 16),
+                        label: const Text('Force Update'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                        ),
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _isConfirmPasswordVisible = !_isConfirmPasswordVisible;
-                        });
-                      },
-                    ),
+                    ],
                   ),
-                  validator: (value) {
-                    // Only validate if new password is entered
-                    if (_newPasswordController.text.isNotEmpty) {
-                      if (value == null || value.isEmpty) {
-                        return 'Please confirm your new password';
-                      }
-                      if (value != _newPasswordController.text) {
-                        return 'Passwords do not match';
-                      }
-                    }
-                    return null;
-                  },
                 ),
-                const SizedBox(height: 32),
+              ),
 
-                // Save Button
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _isLoading ? null : _saveChanges,
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
-                    child: _isLoading
-                        ? const SizedBox(
-                      height: 20,
+              const SizedBox(height: 20),
+
+              // Name Field
+              TextFormField(
+                controller: _nameController,
+                decoration: const InputDecoration(
+                  labelText: 'Full Name',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.person),
+                ),
+                validator: (value) {
+                  if (value == null || value.trim().isEmpty) {
+                    return 'Name is required';
+                  }
+                  return null;
+                },
+              ),
+
+              const SizedBox(height: 16),
+
+              // Email Field (read-only)
+              TextFormField(
+                initialValue: widget.currentEmail,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.email),
+                ),
+                enabled: false,
+              ),
+
+              const SizedBox(height: 24),
+
+              // Password Change Section
+              const Text(
+                'Change Password (Optional)',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              // Current Password
+              TextFormField(
+                controller: _currentPasswordController,
+                decoration: InputDecoration(
+                  labelText: 'Current Password',
+                  border: const OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.lock),
+                  suffixIcon: IconButton(
+                    icon: Icon(_isPasswordVisible ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => _isPasswordVisible = !_isPasswordVisible),
+                  ),
+                ),
+                obscureText: !_isPasswordVisible,
+              ),
+
+              const SizedBox(height: 16),
+
+              // New Password
+              TextFormField(
+                controller: _newPasswordController,
+                decoration: InputDecoration(
+                  labelText: 'New Password',
+                  border: const OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.lock_outline),
+                  suffixIcon: IconButton(
+                    icon: Icon(_isNewPasswordVisible ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => _isNewPasswordVisible = !_isNewPasswordVisible),
+                  ),
+                ),
+                obscureText: !_isNewPasswordVisible,
+                validator: (value) {
+                  if (value != null && value.isNotEmpty && value.length < 6) {
+                    return 'Password must be at least 6 characters';
+                  }
+                  return null;
+                },
+              ),
+
+              const SizedBox(height: 16),
+
+              // Confirm New Password
+              TextFormField(
+                controller: _confirmPasswordController,
+                decoration: InputDecoration(
+                  labelText: 'Confirm New Password',
+                  border: const OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.lock_outline),
+                  suffixIcon: IconButton(
+                    icon: Icon(_isConfirmPasswordVisible ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => _isConfirmPasswordVisible = !_isConfirmPasswordVisible),
+                  ),
+                ),
+                obscureText: !_isConfirmPasswordVisible,
+                validator: (value) {
+                  if (_newPasswordController.text.isNotEmpty && value != _newPasswordController.text) {
+                    return 'Passwords do not match';
+                  }
+                  return null;
+                },
+              ),
+
+              const SizedBox(height: 24),
+
+              // Error Message
+              if (_errorMessage.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade50,
+                    border: Border.all(color: Colors.red.shade200),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _errorMessage,
+                    style: TextStyle(color: Colors.red.shade700),
+                  ),
+                ),
+
+              // Success Message
+              if (_successMessage.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade50,
+                    border: Border.all(color: Colors.green.shade200),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _successMessage,
+                    style: TextStyle(color: Colors.green.shade700),
+                  ),
+                ),
+
+              const SizedBox(height: 24),
+
+              // Save Button
+              ElevatedButton(
+                onPressed: _isLoading ? null : _saveChanges,
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  backgroundColor: Theme.of(context).primaryColor,
+                  foregroundColor: Colors.white,
+                ),
+                child: _isLoading
+                    ? const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(
                       width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                        : const Text('Save Changes', style: TextStyle(fontSize: 16)),
-                  ),
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
+                    ),
+                    SizedBox(width: 12),
+                    Text('Saving Changes...'),
+                  ],
+                )
+                    : const Text(
+                  'Save Changes',
+                  style: TextStyle(fontSize: 16),
                 ),
-              ],
-            ),
+              ),
+
+              const SizedBox(height: 16),
+
+              // Cancel Button
+              TextButton(
+                onPressed: _isLoading ? null : () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+            ],
           ),
         ),
       ),
